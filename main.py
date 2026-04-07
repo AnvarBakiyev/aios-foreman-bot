@@ -14,22 +14,26 @@ DIRECTOR_CHAT = os.environ.get("DIRECTOR_CHAT_ID", "")
 PORT          = int(os.environ.get("PORT", 8080))
 TG            = "https://api.telegram.org/bot" + BOT_TOKEN
 
+# Per-user object name storage (in-memory, resets on redeploy)
+# Format: {chat_id: "ЖК Северный блок 3"}
+USER_OBJECTS = {}
+
+GREEN  = "🟢"
+YELLOW = "🟡"
+RED    = "🔴"
+
+
+def get_icon(assess):
+    if "НОРМ" in assess or "ПЕРЕВЫП" in assess:
+        return GREEN
+    elif "НЕЗНАЧ" in assess:
+        return YELLOW
+    return RED
+
 
 def send(chat_id, text):
     requests.post(TG + "/sendMessage",
                   json={"chat_id": chat_id, "text": text[:4096]}, timeout=15)
-
-
-def send_md(chat_id, text):
-    r = requests.post(TG + "/sendMessage",
-                      json={"chat_id": chat_id, "text": text[:4096],
-                            "parse_mode": "Markdown",
-                            "disable_web_page_preview": False}, timeout=15)
-    if r.status_code != 200:
-        requests.post(TG + "/sendMessage",
-                      json={"chat_id": chat_id,
-                            "text": text[:4096].replace("*","").replace("_","")},
-                      timeout=15)
 
 
 def download_voice(file_id):
@@ -60,22 +64,26 @@ def transcribe(audio_bytes):
         os.unlink(tmp_path)
 
 
-def structure_report(transcript):
+def structure_report(transcript, object_name=""):
+    obj_hint = ""
+    if object_name:
+        obj_hint = "Название объекта: " + object_name + ". "
     prompt = (
+        obj_hint +
         "Структурируй рапорт прораба. Верни JSON:\n"
         "{\n"
-        "  \"object_name\": \"название объекта\",\n"
-        "  \"supervisor\": \"прораб если назвал или пусто\",\n"
+        "  \"object_name\": \"" + (object_name or "название объекта из текста или Объект") + "\",\n"
+        "  \"supervisor\": \"имя прораба если назвал или пусто\",\n"
         "  \"overall_assessment\": \"В НОРМЕ или НЕЗНАЧИТЕЛЬНОЕ ОТСТАВАНИЕ или ЗНАЧИТЕЛЬНОЕ ОТСТАВАНИЕ или ПЕРЕВЫПОЛНЕНИЕ\",\n"
-        "  \"completion_pct\": число,\n"
-        "  \"works\": [{\"name\":\"\",\"plan\":\"\",\"fact\":\"\",\"completion_pct\":0}],\n"
-        "  \"problems\": [{\"description\":\"\",\"urgency\":\"СРОЧНО или СЕГОДНЯ\",\"suggested_action\":\"\",\"responsible\":\"\"}],\n"
-        "  \"material_requests\": [{\"material\":\"\",\"needed_qty\":\"\",\"deadline\":\"\",\"urgency\":\"СРОЧНО или ПЛАНОВЫЙ\"}],\n"
-        "  \"headcount\": {\"actual\":0,\"planned\":0},\n"
-        "  \"next_shift_tasks\": [{\"task\":\"\",\"responsible\":\"\",\"priority\":\"ВЫСОКИЙ или СРЕДНИЙ\"}],\n"
+        "  \"completion_pct\": число от 0 до 100,\n"
+        "  \"works\": [{\"name\":\"вид работы\",\"plan\":\"план\",\"fact\":\"факт\",\"completion_pct\":число}],\n"
+        "  \"problems\": [{\"description\":\"проблема\",\"urgency\":\"СРОЧНО или СЕГОДНЯ\",\"suggested_action\":\"что делать\",\"responsible\":\"кто\"}],\n"
+        "  \"material_requests\": [{\"material\":\"материал\",\"needed_qty\":\"количество если сказал или уточнить\",\"deadline\":\"срок\",\"urgency\":\"СРОЧНО или ПЛАНОВЫЙ\"}],\n"
+        "  \"headcount\": {\"actual\":число,\"planned\":число},\n"
+        "  \"next_shift_tasks\": [{\"task\":\"задача\",\"responsible\":\"кто\",\"priority\":\"ВЫСОКИЙ или СРЕДНИЙ\"}],\n"
         "  \"summary_for_director\": \"2 предложения для директора\"\n"
         "}\n"
-        "Рапорт: " + transcript
+        "Рапорт прораба: " + transcript
     )
     r = requests.post(
         "https://api.openai.com/v1/chat/completions",
@@ -98,7 +106,7 @@ def create_notion_page(d):
     from datetime import datetime
     today = datetime.now().strftime("%d.%m.%Y")
     assess = d.get("overall_assessment", "")
-    icon = "🟢" if ("НОРМ" in assess or "ПЕРЕВЫП" in assess) else "🟡" if "НЕЗНАЧ" in assess else "🔴"
+    icon = get_icon(assess)
 
     def rt(text):
         return {"type": "text", "text": {"content": str(text)[:2000]}}
@@ -130,47 +138,60 @@ def create_notion_page(d):
     blocks = []
     summary = d.get("summary_for_director", "")
     if summary:
-        blocks.append(callout("FOR DIRECTOR: " + summary, "📋"))
+        blocks.append(callout("📋️Для директора: " + summary, "📋"))
         blocks.append(divider())
 
     pct = d.get("completion_pct", 0) or 0
-    blocks.append(para(icon + " " + assess + " — " + str(int(pct)) + "% плана | Прораб: " + d.get("supervisor", "-") + " | " + today))
-
     hc = d.get("headcount", {})
-    if hc:
-        blocks.append(para("Персонал: " + str(hc.get("actual","-")) + "/" + str(hc.get("planned","-")) + " чел."))
-
+    blocks.append(para(icon + " " + assess + " — " + str(int(pct)) + "% плана"))
+    if hc and hc.get("actual"):
+        blocks.append(para("👥 Персонал: " + str(hc.get("actual","-")) + "/" + str(hc.get("planned","-")) + " чел."))
     blocks.append(divider())
 
-    for w in d.get("works", []):
-        wp = w.get("completion_pct", 0) or 0
-        ic = "✅" if wp >= 95 else "⚠️" if wp >= 75 else "🔴"
-        blocks.append(bullet(ic + " " + w.get("name","") + " — " + str(w.get("fact","")) + " из " + str(w.get("plan","")) + " (" + str(int(wp)) + "%)"))
+    works = d.get("works", [])
+    if works:
+        blocks.append(h2("📊 Выполнение"))
+        for w in works:
+            wp = w.get("completion_pct", 0) or 0
+            ic = "✅" if wp >= 95 else "⚠️" if wp >= 75 else "🔴"
+            blocks.append(bullet(ic + " " + w.get("name","") + " — " + str(w.get("fact","")) + " из " + str(w.get("plan","")) + " (" + str(int(wp)) + "%)"))
+        blocks.append(divider())
 
     problems = d.get("problems", [])
     if problems:
-        blocks.append(divider())
-        blocks.append(h2("Проблемы (" + str(len(problems)) + ")"))
+        blocks.append(h2("🚨 Проблемы (" + str(len(problems)) + ")"))
         for pr in problems:
             u = pr.get("urgency","")
             blocks.append(callout("[" + u + "] " + pr.get("description",""), "⚠️"))
             if pr.get("suggested_action"):
                 blocks.append(todo("→ " + pr.get("suggested_action","") + " (" + pr.get("responsible","-") + ")"))
+        blocks.append(divider())
 
     mats = d.get("material_requests", [])
     if mats:
-        blocks.append(divider())
-        blocks.append(h2("Заявки на материалы"))
+        blocks.append(h2("📦 Заявки на материалы"))
         for m in mats:
-            blocks.append(todo(m.get("material","") + " — " + str(m.get("needed_qty","")) + " | срок: " + str(m.get("deadline",""))))
+            u = m.get("urgency","")
+            ic = "🔴" if "СРОЧНО" in u else "🟡"
+            blocks.append(todo(ic + " " + m.get("material","") + " — " + str(m.get("needed_qty","")) + " | срок: " + str(m.get("deadline",""))))
+        blocks.append(divider())
 
-    for t in d.get("next_shift_tasks", []):
-        blocks.append(todo(t.get("task","") + " → " + t.get("responsible","-")))
+    next_tasks = d.get("next_shift_tasks", [])
+    if next_tasks:
+        blocks.append(h2("📋 Следующей смене"))
+        for t in next_tasks:
+            p_ic = "🔴" if "ВЫСОКИЙ" in t.get("priority","") else "🟡"
+            blocks.append(todo(p_ic + " " + t.get("task","") + " → " + t.get("responsible","-")))
 
     blocks.append(divider())
     blocks.append(para("Создано Extella AI | " + today))
 
-    title = icon + " " + d.get("object_name","Объект") + " | " + today
+    obj_name = d.get("object_name","Объект")
+    sup = d.get("supervisor","")
+    title = icon + " " + obj_name + " | " + today
+    if sup:
+        title = icon + " " + obj_name + " | " + sup + " | " + today
+
     payload = {
         "parent": {"type": "page_id", "page_id": NOTION_PARENT},
         "properties": {"title": {"title": [{"text": {"content": title}}]}},
@@ -189,29 +210,30 @@ def notify_director(d, notion_url):
         return
     assess = d.get("overall_assessment","")
     pct = d.get("completion_pct",0) or 0
-    icon = "🟢" if ("НОРМ" in assess or "ПЕРЕВЫП" in assess) else "🟡" if "НЕЗНАЧ" in assess else "🔴"
+    icon = get_icon(assess)
     problems = d.get("problems",[])
     mats = [m for m in d.get("material_requests",[]) if "СРОЧНО" in m.get("urgency","")]
     obj = d.get("object_name","Объект")
-    sup = d.get("supervisor","-")
+    sup = d.get("supervisor","")
     summ = d.get("summary_for_director","")
     lines = []
     lines.append(icon + " " + obj + " — " + str(int(pct)) + "% плана")
-    lines.append("Прораб: " + sup)
+    if sup:
+        lines.append("👷 " + sup)
     if summ:
         lines.append(summ)
     if problems:
-        lines.append("Проблем: " + str(len(problems)))
+        lines.append("🚨 Проблем: " + str(len(problems)))
         for pr in problems[:2]:
-            lines.append("  - " + pr.get("description","")[:60])
+            lines.append("  • " + pr.get("description","")[:60])
     if mats:
-        lines.append("Срочные заявки: " + str(len(mats)))
+        lines.append("📦 Срочные заявки: " + str(len(mats)))
         for m in mats[:2]:
-            lines.append("  - " + m.get("material","") + " " + str(m.get("needed_qty","")))
+            lines.append("  • " + m.get("material","") + " — " + str(m.get("needed_qty","")))
     if notion_url:
-        lines.append("Рапорт: " + notion_url)
-    text = "\n".join(lines)
-    send(DIRECTOR_CHAT, text)
+        lines.append("
+📎 Рапорт: " + notion_url)
+    send(DIRECTOR_CHAT, "\n".join(lines))
 
 
 @app.route("/webhook", methods=["POST"])
@@ -222,54 +244,98 @@ def webhook():
     if not chat_id:
         return jsonify({"ok": True})
 
-    text = message.get("text", "")
+    text = message.get("text", "").strip()
     voice = message.get("voice")
 
+    # /start
     if text.startswith("/start"):
-        send(chat_id, "Привет! Запиши голосовое сообщение о том что сделали за смену. Я сам создам рапорт в Notion и уведомлю директора.")
+        send(chat_id,
+             "👷 Привет! Я помогаю прорабам отправлять рапорты.\n\n"
+             "🏗 Сначала укажи свой объект:\n"
+             "/object ЖК Северный блок 3\n\n"
+             "Потом просто записывай голосовое и отправляй сюда.")
         return jsonify({"ok": True})
 
+    # /object ЖК Северный блок 3
+    if text.startswith("/object"):
+        obj_name = text[7:].strip()
+        if obj_name:
+            USER_OBJECTS[chat_id] = obj_name
+            send(chat_id, "✅ Объект запоминал: " + obj_name + "\n\nТеперь просто записывай голосовое о смене.")
+        else:
+            current = USER_OBJECTS.get(chat_id, "не установлен")
+            send(chat_id, "Текущий объект: " + current + "\nИспользование: /object Название")
+        return jsonify({"ok": True})
+
+    # /help
+    if text.startswith("/help"):
+        current_obj = USER_OBJECTS.get(chat_id, "не установлен")
+        send(chat_id,
+             "📋 Команды:\n"
+             "/object [название] — запомнить свой объект\n"
+             "/object — показать текущий\n\n"
+             "🏗 Твой объект: " + current_obj + "\n\n"
+             "🎤 Просто запиши голосовое: что сделали, проблемы, сколько рабочих.")
+        return jsonify({"ok": True})
+
+    # Voice message
     if voice:
-        send(chat_id, "Расшифровываю...")
+        send(chat_id, "⏳ Расшифровываю...")
         audio_bytes = download_voice(voice["file_id"])
         if not audio_bytes:
-            send(chat_id, "Не удалось скачать аудио. Попробуй ещё раз.")
+            send(chat_id, "❌ Не удалось скачать аудио. Попробуй ещё раз.")
             return jsonify({"ok": True})
         transcript = transcribe(audio_bytes)
         if not transcript:
-            send(chat_id, "Не удалось расшифровать. Говори чуть громче.")
+            send(chat_id, "❌ Не удалось расшифровать. Говори чуть громче.")
             return jsonify({"ok": True})
-        send(chat_id, "Расшифровал: " + transcript[:200] + "\nСоздаю рапорт...")
-        report = structure_report(transcript)
+        send(chat_id, "✅ Расшифровал. Создаю рапорт...")
+        object_name = USER_OBJECTS.get(chat_id, "")
+        report = structure_report(transcript, object_name)
         if not report:
-            send(chat_id, "Ошибка обработки. Попробуй ещё раз.")
+            send(chat_id, "❌ Ошибка обработки. Попробуй ещё раз.")
             return jsonify({"ok": True})
         notion_url = create_notion_page(report)
         notify_director(report, notion_url)
         assess = report.get("overall_assessment","")
         pct = report.get("completion_pct",0) or 0
-        icon = "🟢" if ("НОРМ" in assess or "ПЕРЕВЫП" in assess) else "🟡" if "НЕЗНАЧ" in assess else "🔴"
-        reply = icon + " Рапорт принят! " + assess + " — " + str(int(pct)) + "% плана"
+        icon = get_icon(assess)
+        problems = report.get("problems",[])
+        mats = report.get("material_requests",[])
+        obj = report.get("object_name", object_name or "Объект")
+        lines = []
+        lines.append(icon + " Рапорт принят!")
+        lines.append("🏗 " + obj)
+        lines.append("📊 " + assess + " — " + str(int(pct)) + "% плана")
+        if problems:
+            lines.append("🚨 Проблем: " + str(len(problems)))
+        if mats:
+            lines.append("📦 Заявок: " + str(len(mats)))
         if notion_url:
-            reply = reply + "\nNotion: " + notion_url
-        reply = reply + "\nДиректор уведомлён."
-        send(chat_id, reply)
+            lines.append("📋 Notion: " + notion_url)
+        lines.append("✅ Директор уведомлён.")
+        if not object_name:
+            lines.append("\n💡 Чтобы запомнить название объекта: /object ЖК Северный блок 3")
+        send(chat_id, "\n".join(lines))
         return jsonify({"ok": True})
 
+    # Text report
     if text and len(text) > 20 and not text.startswith("/"):
-        send(chat_id, "Обрабатываю...")
-        report = structure_report(text)
+        send(chat_id, "⏳ Обрабатываю...")
+        object_name = USER_OBJECTS.get(chat_id, "")
+        report = structure_report(text, object_name)
         if report:
             notion_url = create_notion_page(report)
             notify_director(report, notion_url)
-            send(chat_id, "Готово! " + (notion_url or "Рапорт создан"))
-
+            assess = report.get("overall_assessment","")
+            icon = get_icon(assess)
+            send(chat_id, icon + " Готово! " + (notion_url or "Рапорт создан"))
     return jsonify({"ok": True})
 
 
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({"status": "ok"})
+    return jsonify({"status": "ok", "service": "aios-foreman-bot"})
 
 
 @app.route("/set_webhook", methods=["GET"])
