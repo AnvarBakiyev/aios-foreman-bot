@@ -144,7 +144,7 @@ def create_notion_page(d):
 
     for w in d.get("works", []):
         wp = w.get("completion_pct", 0) or 0
-        ic = "OK" if wp >= 95 else "WARNING" if wp >= 75 else "PROBLEM"
+        ic = "✅" if wp >= 95 else "⚠️" if wp >= 75 else "🔴"
         blocks.append(bullet(ic + " " + w.get("name","") + " — " + str(w.get("fact","")) + " из " + str(w.get("plan","")) + " (" + str(int(wp)) + "%)"))
 
     problems = d.get("problems", [])
@@ -189,14 +189,14 @@ def notify_director(d, notion_url):
         return
     assess = d.get("overall_assessment","")
     pct = d.get("completion_pct",0) or 0
-    icon = "OK" if ("НОРМ" in assess or "ПЕРЕВЫП" in assess) else "WARNING" if "НЕЗНАЧ" in assess else "CRITICAL"
+    icon = "🟢" if ("НОРМ" in assess or "ПЕРЕВЫП" in assess) else "🟡" if "НЕЗНАЧ" in assess else "🔴"
     problems = d.get("problems",[])
     mats = [m for m in d.get("material_requests",[]) if "СРОЧНО" in m.get("urgency","")]
     obj = d.get("object_name","Объект")
     sup = d.get("supervisor","-")
     summ = d.get("summary_for_director","")
     lines = []
-    lines.append("[" + icon + "] " + obj + " — " + str(int(pct)) + "% плана")
+    lines.append(icon + " " + obj + " — " + str(int(pct)) + "% плана")
     lines.append("Прораб: " + sup)
     if summ:
         lines.append(summ)
@@ -248,8 +248,8 @@ def webhook():
         notify_director(report, notion_url)
         assess = report.get("overall_assessment","")
         pct = report.get("completion_pct",0) or 0
-        icon = "OK" if ("НОРМ" in assess or "ПЕРЕВЫП" in assess) else "WARNING" if "НЕЗНАЧ" in assess else "CRITICAL"
-        reply = "[" + icon + "] Рапорт принят! " + assess + " — " + str(int(pct)) + "% плана"
+        icon = "🟢" if ("НОРМ" in assess or "ПЕРЕВЫП" in assess) else "🟡" if "НЕЗНАЧ" in assess else "🔴"
+        reply = icon + " Рапорт принят! " + assess + " — " + str(int(pct)) + "% плана"
         if notion_url:
             reply = reply + "\nNotion: " + notion_url
         reply = reply + "\nДиректор уведомлён."
