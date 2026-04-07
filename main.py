@@ -342,4 +342,7 @@ def set_webhook():
     return jsonify(r.json())
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=PORT)
+    import logging
+    logging.basicConfig(level=logging.INFO)
+    print(f"Starting AIOS Foreman Bot on port {PORT}", flush=True)
+    app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False)
