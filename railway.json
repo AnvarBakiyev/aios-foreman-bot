@@ -1,0 +1,7 @@
+{
+  "deploy": {
+    "startCommand": "python main.py",
+    "healthcheckPath": "/health",
+    "healthcheckTimeout": 30
+  }
+}
