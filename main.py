@@ -79,7 +79,7 @@ def transcribe(audio_bytes):
 
 
 def structure_report(transcript, object_name=""):
-    system = "Ты опытный начальник смены строительного объекта. Структурируй рапорт прораба в JSON."
+    system = "Ты опытный начальник смены строительного объекта. Структурируй рапорт проба в JSON."
     obj_hint = ("Объект: " + object_name + ". ") if object_name else ""
     prompt = (
         obj_hint +
@@ -211,11 +211,14 @@ def notify_director(d, notion_url):
 
 def call_extella_expert(expert_name, params, timeout=180):
     """
-    Запускает эксперт Extella и ждёт результат через поллинг task/check.
+    Запускает эксперт Extella и ждёт результат.
 
-    Структура ответа check_task:
-      {"result": {"status": "success", "items_extracted": 6, ...}}
-    То есть result == прямой вывод эксперта.
+    Последовательность:
+    1. POST /api/expert/run  →  получаем task_id
+    2. Поллинг /api/task/check пока status != running/busy
+       - running  → продолжаем ждать
+       - completed → забираем результат через /api/task/result
+    3. GET /api/task/result?task_id=...  →  получаем вывод эксперта
     """
     headers = {"X-Auth-Token": EXTELLA_TOKEN, "Content-Type": "application/json"}
 
@@ -239,11 +242,10 @@ def call_extella_expert(expert_name, params, timeout=180):
     if not task_id:
         return None, "Нет task_id в ответе Extella"
 
-    # 2. Поллинг /api/task/check
-    # Ответ: {"result": {<вывод эксперта>}}
-    # То есть result = ещё не готов если {"status": "running"} без остальных полей
+    # 2. Поллинг /api/task/check пока задача не завершится
     deadline = time.time() + timeout
     poll_interval = 8
+    completed = False
 
     while time.time() < deadline:
         time.sleep(poll_interval)
@@ -261,26 +263,46 @@ def call_extella_expert(expert_name, params, timeout=180):
         if check_resp.status_code != 200:
             continue
 
-        # Ответ check_task:
-        # Пока выполняется: {"result": {"status": "running"}}
-        # Готово:          {"result": {"status": "success", "items_extracted": 6, ...}}
         data = check_resp.json()
-        result = data.get("result", {})
+        # Структура ответа check: {"result": {"status": "running"}} или {"result": {"status": "completed"}}
+        inner = data.get("result", {})
+        if isinstance(inner, str):
+            try: inner = json.loads(inner)
+            except: inner = {}
 
-        if isinstance(result, str):
-            try: result = json.loads(result)
-            except: result = {}
+        device_status = inner.get("status", "")
 
-        result_status = result.get("status", "")
+        if device_status == "completed":
+            completed = True
+            break
 
-        # Задача завершена
-        if result_status in ("success", "error", "no_dispute_needed"):
-            return result, None
+        # running или busy — продолжаем ждать
 
-        # result_status == "running" или "busy" — ждём
-        # Продолжаем поллинг
+    if not completed:
+        return None, f"Превышен лимит ({timeout}с). Устройство занято."
 
-    return None, f"Превышен лимит ({timeout}с). Устройство занято."
+    # 3. Забираем результат через /api/task/result
+    try:
+        result_resp = requests.get(
+            f"{EXTELLA_URL}/api/task/result",
+            headers=headers,
+            params={"task_id": task_id},
+            timeout=30
+        )
+    except Exception as e:
+        return None, f"Ошибка получения результата: {e}"
+
+    if result_resp.status_code != 200:
+        return None, f"task/result API {result_resp.status_code}: {result_resp.text[:200]}"
+
+    result_data = result_resp.json()
+    # Ожидаем: {"result": {"status": "success", "items_extracted": 6, ...}}
+    result = result_data.get("result", {})
+    if isinstance(result, str):
+        try: result = json.loads(result)
+        except: result = {}
+
+    return result, None
 
 
 def run_ks2_pipeline(chat_id, pdf_bytes, subcontractor, ks2_number):
@@ -298,7 +320,6 @@ def run_ks2_pipeline(chat_id, pdf_bytes, subcontractor, ks2_number):
             "openai_key":         OPENAI_KEY,
             "subcontractor_name": subcontractor,
             "ks2_number":         ks2_number,
-            # telegram_chat_id НЕ передаём — пайплайн не шлёт своё сообщение
         },
         timeout=180
     )
@@ -333,7 +354,7 @@ def run_ks2_pipeline(chat_id, pdf_bytes, subcontractor, ks2_number):
     if dispute:
         lines += [f"", f"⚠️ <b>ЗАМЕЧАНИЯ! Превышение: {overrun:,} тг</b>"]
         for v in violations[:3]: lines.append(f"  • {v[:80]}")
-        if len(violations) > 3: lines.append(f"  ... и ещё {len(violations)-3}")
+        if len in violations and len(violations) > 3: lines.append(f"  ... и ещё {len(violations)-3}")
         lines += [f"", f"📄 Письмо-замечание сформировано автоматически"]
     else:
         lines += [f"", f"✅ <b>Замечаний нет — КС-2 можно принять</b>"]
@@ -368,7 +389,7 @@ def webhook():
     document = message.get("document")
 
     if text.startswith("/start"):
-        send(chat_id, "Привет! Я помогаю прорабам и ПТО.\n\n"
+        send(chat_id, "Привет! Я помогаю пробам и ПТО.\n\n"
                      "📢 Голосовой рапорт:\n"
                      "  1. /object ЖК Северный блок 3\n"
                      "  2. Запиши голосовое\n\n"
@@ -493,7 +514,7 @@ def webhook():
 
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({"status": "ok", "service": "aios-foreman-bot", "version": "2.5"})
+    return jsonify({"status": "ok", "service": "aios-foreman-bot", "version": "2.6"})
 
 
 @app.route("/set_webhook", methods=["GET"])
