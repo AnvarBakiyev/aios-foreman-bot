@@ -202,41 +202,62 @@ def notify_director(d, notion_url):
 # ───────────────────────────────────────────────────────────────────
 
 def launch_ks2_pipeline(chat_id, pdf_bytes, subcontractor, ks2_number):
-    """
-    Fire-and-forget: запускаем эксперт с telegram_chat_id.
-    Эксперт сам отправляет результат в Telegram.
-    Бот НИЧЕГО не ждёт и НИЧЕГО не отправляет.
-    """
     if not EXTELLA_TOKEN:
         send(chat_id, "❌ EXTELLA_API_TOKEN не настроен.")
         return
-
     headers = {"X-Auth-Token": EXTELLA_TOKEN, "Content-Type": "application/json"}
-    b64_pdf = base64.b64encode(pdf_bytes).decode("utf-8")
-
     try:
-        # Просто запускаем. Не ждём результата.
         requests.post(
             f"{EXTELLA_URL}/api/expert/run",
             headers=headers,
             json={
                 "expert_name": "aios_ks2_pipeline_full",
                 "params": {
-                    "base64_pdf":         b64_pdf,
+                    "base64_pdf":         base64.b64encode(pdf_bytes).decode("utf-8"),
                     "openai_key":         OPENAI_KEY,
                     "subcontractor_name": subcontractor,
                     "ks2_number":         ks2_number,
-                    "telegram_chat_id":   str(chat_id),  # ВОТ ГЛАВНОЕ: реальный chat_id
+                    "telegram_chat_id":   str(chat_id),
                 }
             },
-            timeout=30  # ждём только подтверждения запуска, не выполнения
+            timeout=30
         )
-        # Дальше ничего не делаем.
-        # Эксперт сам уведомит пользователя через telegram_chat_id.
     except requests.exceptions.Timeout:
-        pass  # нормально, задача всё равно запущена
+        pass
     except Exception as e:
         send(chat_id, f"❌ Ошибка запуска: {e}")
+
+
+# ───────────────────────────────────────────────────────────────────
+# Digest: fire-and-forget
+# ───────────────────────────────────────────────────────────────────
+
+def launch_digest(chat_id, hours_back="24"):
+    """Fire-and-forget: запускаем дайджест, эксперт сам отправит результат."""
+    if not EXTELLA_TOKEN:
+        send(chat_id, "❌ EXTELLA_API_TOKEN не настроен.")
+        return
+    headers = {"X-Auth-Token": EXTELLA_TOKEN, "Content-Type": "application/json"}
+    try:
+        requests.post(
+            f"{EXTELLA_URL}/api/expert/run",
+            headers=headers,
+            json={
+                "expert_name": "aios_morning_digest_notion",
+                "params": {
+                    "notion_token_key":      "notion_token",
+                    "notion_parent_page_id": "33b9e9a3a25480b3808bccaa115f8207",
+                    "openai_key_name":       "openai_api_key",
+                    "telegram_chat_id":      str(chat_id),
+                    "hours_back":            hours_back
+                }
+            },
+            timeout=30
+        )
+    except requests.exceptions.Timeout:
+        pass
+    except Exception as e:
+        send(chat_id, f"❌ Ошибка запуска дайджеста: {e}")
 
 
 # ───────────────────────────────────────────────────────────────────
@@ -268,7 +289,8 @@ def webhook():
     if text.startswith("/start"):
         send(chat_id, "Привет! Я помогаю прорабам и ПТО.\n\n"
                      "📢 Голосовой рапорт:\n  1. /object ЖК Северный блок 3\n  2. Запиши голосовое\n\n"
-                     "📄 Проверка КС-2 (PDF):\n  1. /subcontractor ТОО СтройМонтаж\n  2. /ks2number 1\n  3. Прикрепи PDF")
+                     "📄 Проверка КС-2 (PDF):\n  1. /subcontractor ТОО СтройМонтаж\n  2. /ks2number 1\n  3. Прикрепи PDF\n\n"
+                     "🌅 Утренний дайджест:\n  /digest — сводка по всем объектам за 24ч\n  /digest48 — за 48ч")
         return jsonify({"ok": True})
 
     if text.startswith("/object"):
@@ -298,15 +320,30 @@ def webhook():
             send(chat_id, f"Текущий: {USER_KS2_NUMBER.get(chat_id, '1')}")
         return jsonify({"ok": True})
 
-    if text.startswith("/help"):
-        send(chat_id, f"Команды:\n/object, /subcontractor, /ks2number\n\n"
-                      f"Объект: {USER_OBJECTS.get(chat_id, 'не задан')}\n"
-                      f"Субподрядчик: {USER_SUBCONTRACTOR.get(chat_id, 'не задан')}\n"
-                      f"Номер КС-2: {USER_KS2_NUMBER.get(chat_id, '1')}\n\n"
-                      f"PDF отправляйте по одному, результат придёт автоматически")
+    # ── /digest — утренний дайджест
+    if text.startswith("/digest"):
+        hours = "48" if "48" in text else "24"
+        send(chat_id, f"🌅 Генерирую дайджест за последние {hours} часов... ~20-30 секунд.")
+        threading.Thread(
+            target=launch_digest,
+            args=(chat_id, hours),
+            daemon=True
+        ).start()
         return jsonify({"ok": True})
 
-    # ── PDF → КС-2 (fire-and-forget)
+    if text.startswith("/help"):
+        send(chat_id, f"Команды:\n"
+                      f"/object [название] — объект\n"
+                      f"/subcontractor [название] — субподрядчик\n"
+                      f"/ks2number [номер] — номер акта\n"
+                      f"/digest — дайджест за 24ч\n"
+                      f"/digest48 — дайджест за 48ч\n\n"
+                      f"Объект: {USER_OBJECTS.get(chat_id, 'не задан')}\n"
+                      f"Субподрядчик: {USER_SUBCONTRACTOR.get(chat_id, 'не задан')}\n"
+                      f"Номер КС-2: {USER_KS2_NUMBER.get(chat_id, '1')}")
+        return jsonify({"ok": True})
+
+    # ── PDF → КС-2
     if document:
         mime  = document.get("mime_type", "")
         fname = document.get("file_name", "").lower()
@@ -324,11 +361,7 @@ def webhook():
                 USER_KS2_NUMBER[chat_id] = str(int(ks2_number) + 1)
             except Exception:
                 pass
-
-            # Сообщаем что получили файл
             send(chat_id, "⏳ Анализирую КС-2... Результат придёт через ~30-60 секунд.")
-
-            # Запускаем в фоновом потоке
             threading.Thread(
                 target=launch_ks2_pipeline,
                 args=(chat_id, pdf_bytes, subcontractor, ks2_number),
@@ -388,7 +421,7 @@ def webhook():
 
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({"status": "ok", "service": "aios-foreman-bot", "version": "2.8"})
+    return jsonify({"status": "ok", "service": "aios-foreman-bot", "version": "2.9"})
 
 
 @app.route("/set_webhook", methods=["GET"])
