@@ -3,6 +3,7 @@ import json
 import base64
 import tempfile
 import threading
+import time
 import requests
 from flask import Flask, request, jsonify
 
@@ -211,48 +212,121 @@ def notify_director(d, notion_url):
 # КС-2 PIPELINE
 # ───────────────────────────────────────────────────────────────────
 
+def call_extella_expert(expert_name, params, timeout=180):
+    """
+    Вызывает эксперт Extella с поллингом task_id.
+    Extella API возвращает task_id сразу (асинхронно).
+    Поллинг /api/task/check до завершения.
+    Возвращает (result_dict, error_message)
+    """
+    headers = {"X-Auth-Token": EXTELLA_TOKEN, "Content-Type": "application/json"}
+
+    # 1. Запуск эксперта
+    try:
+        run_resp = requests.post(
+            f"{EXTELLA_URL}/api/expert/run",
+            headers=headers,
+            json={"expert_name": expert_name, "params": params},
+            timeout=30  # Только ждём запуска, не выполнения
+        )
+    except Exception as e:
+        return None, f"Ошибка запуска: {e}"
+
+    if run_resp.status_code != 200:
+        return None, f"Extella API {run_resp.status_code}: {run_resp.text[:200]}"
+
+    run_data = run_resp.json()
+    task_id  = run_data.get("task_id")
+
+    # Если результат уже есть в ответе (synchronous fallback)
+    if "result" in run_data and run_data["result"]:
+        result = run_data["result"]
+        if isinstance(result, str):
+            try: result = json.loads(result)
+            except: pass
+        return result, None
+
+    if not task_id:
+        return None, "Нет task_id в ответе Extella"
+
+    # 2. Поллинг: опрашиваем /api/task/check пока эксперт не завершит
+    deadline = time.time() + timeout
+    poll_interval = 8  # проверяем каждые 8 секунд
+
+    while time.time() < deadline:
+        time.sleep(poll_interval)
+        try:
+            check_resp = requests.post(
+                f"{EXTELLA_URL}/api/task/check",
+                headers=headers,
+                json={"task_id": task_id},
+                timeout=15
+            )
+        except Exception as e:
+            continue  # нетворк ошибка — повторим
+
+        if check_resp.status_code != 200:
+            continue
+
+        check_data = check_resp.json()
+
+        # check_task возвращает {"result": {"result": {...эксперт вывод...}}}
+        outer = check_data.get("result", {})
+        if isinstance(outer, str):
+            try: outer = json.loads(outer)
+            except: outer = {}
+
+        # Узнаём статус устройства
+        device_status = outer.get("status", "")
+
+        # Если в ответе есть вложенный result — это вывод эксперта
+        inner = outer.get("result", {})
+        if isinstance(inner, str):
+            try: inner = json.loads(inner)
+            except: inner = {}
+
+        # Задача выполнена если:
+        # 1. Внутренний result содержит status="success"
+        # 2. Или внешний status="running" и есть внутренний result
+        if inner.get("status") in ("success", "error", "no_dispute_needed"):
+            return inner, None
+        if device_status == "running" and inner:
+            return inner, None
+
+        # Ещё выполняется (устройство busy) — ждём
+
+    return None, f"Превышен лимит ожидания ({timeout}с). Устройство занято."
+
+
 def run_ks2_pipeline(chat_id, pdf_bytes, subcontractor, ks2_number):
-    """Runs in background thread. Pipeline does NOT send Telegram — bot sends once here."""
+    """Background thread: calls Extella expert with polling, sends ONE result message."""
     if not EXTELLA_TOKEN:
         send(chat_id, "❌ EXTELLA_API_TOKEN не настроен.")
         return
 
-    send(chat_id, "⏳ Анализирую КС-2... ~30-40 секунд.")
+    send(chat_id, "⏳ Анализирую КС-2... ~30-60 секунд.")
 
-    try:
-        resp = requests.post(
-            f"{EXTELLA_URL}/api/expert/run",
-            headers={"X-Auth-Token": EXTELLA_TOKEN, "Content-Type": "application/json"},
-            json={
-                "expert_name": "aios_ks2_pipeline_full",
-                "params": {
-                    "base64_pdf":         base64.b64encode(pdf_bytes).decode("utf-8"),
-                    "openai_key":         OPENAI_KEY,
-                    "subcontractor_name": subcontractor,
-                    "ks2_number":         ks2_number,
-                    # telegram_chat_id NOT passed — pipeline skips its own Telegram step
-                    # This bot sends the ONE result message below
-                }
-            },
-            timeout=150
-        )
-    except requests.exceptions.Timeout:
-        send(chat_id, "⏱ Устройство занято. Попробуй через минуту.")
-        return
-    except Exception as e:
-        send(chat_id, f"❌ Ошибка: {e}")
+    result, error = call_extella_expert(
+        "aios_ks2_pipeline_full",
+        {
+            "base64_pdf":         base64.b64encode(pdf_bytes).decode("utf-8"),
+            "openai_key":         OPENAI_KEY,
+            "subcontractor_name": subcontractor,
+            "ks2_number":         ks2_number,
+            # telegram_chat_id НЕ передаём — пайплайн не шлёт своё сообщение
+        },
+        timeout=180
+    )
+
+    if error:
+        send(chat_id, f"❌ {error}")
         return
 
-    if resp.status_code != 200:
-        send(chat_id, f"❌ Extella {resp.status_code}. Попробуй позже.")
+    if not result or result.get("status") == "error":
+        send(chat_id, f"❌ Ошибка: {result.get('message', '') if result else 'Пустой ответ'}")
         return
 
-    result = resp.json().get("result", {})
-    if result.get("status") == "error":
-        send(chat_id, f"❌ Шаг {result.get('step','?')}: {result.get('message','')}")
-        return
-
-    # Бот формирует и отправляет единственное сообщение
+    # Формируем единственное сообщение бота
     risk       = result.get("overall_risk", "")
     dispute    = result.get("dispute_needed", False)
     overrun    = result.get("overrun_total_tg", 0)
@@ -279,7 +353,7 @@ def run_ks2_pipeline(chat_id, pdf_bytes, subcontractor, ks2_number):
         lines += [f"", f"📄 Письмо-замечание сформировано автоматически"]
     else:
         lines += [f"", f"✅ <b>Замечаний нет — КС-2 можно принять</b>"]
-    lines += [f"", f"📁 Excel сверка и реестр сохраненыч на устройстве"]
+    lines += [f"", f"📁 Excel сверка и реестр сохранены на устройстве"]
     send(chat_id, "\n".join(lines), parse_mode="HTML")
 
 
@@ -296,7 +370,7 @@ def webhook():
     if not chat_id:
         return jsonify({"ok": True})
 
-    # Dedup protection
+    # Dedup
     if update_id:
         with PROCESSED_LOCK:
             if update_id in PROCESSED_UPDATES:
@@ -382,7 +456,7 @@ def webhook():
                 args=(chat_id, pdf_bytes, subcontractor, ks2_number),
                 daemon=True
             ).start()
-            return jsonify({"ok": True})  # Сразу 200 OK — Telegram не будет ретраитить
+            return jsonify({"ok": True})
         else:
             send(chat_id, "⚠️ Я принимаю только PDF.")
             return jsonify({"ok": True})
@@ -439,7 +513,7 @@ def webhook():
 
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({"status": "ok", "service": "aios-foreman-bot", "version": "2.3"})
+    return jsonify({"status": "ok", "service": "aios-foreman-bot", "version": "2.4"})
 
 
 @app.route("/set_webhook", methods=["GET"])
