@@ -1,20 +1,26 @@
 import os
 import json
+import base64
 import tempfile
 import requests
 from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
-BOT_TOKEN     = os.environ["BOT_TOKEN"]
-OPENAI_KEY    = os.environ["OPENAI_API_KEY"]
-NOTION_TOKEN  = os.environ["NOTION_TOKEN"]
-NOTION_PARENT = os.environ["NOTION_PARENT_PAGE_ID"]
-DIRECTOR_CHAT = os.environ.get("DIRECTOR_CHAT_ID", "")
-PORT          = int(os.environ.get("PORT", 8080))
-TG            = "https://api.telegram.org/bot" + BOT_TOKEN
+BOT_TOKEN       = os.environ["BOT_TOKEN"]
+OPENAI_KEY      = os.environ["OPENAI_API_KEY"]
+NOTION_TOKEN    = os.environ["NOTION_TOKEN"]
+NOTION_PARENT   = os.environ["NOTION_PARENT_PAGE_ID"]
+DIRECTOR_CHAT   = os.environ.get("DIRECTOR_CHAT_ID", "")
+EXTELLA_TOKEN   = os.environ.get("EXTELLA_API_TOKEN", "")
+EXTELLA_URL     = os.environ.get("EXTELLA_API_URL", "https://api.extella.ai")
+PORT            = int(os.environ.get("PORT", 8080))
+TG              = "https://api.telegram.org/bot" + BOT_TOKEN
 
-USER_OBJECTS = {}
+# Состояние пользователей (в памяти, достаточно для MVP)
+USER_OBJECTS       = {}   # chat_id -> object_name
+USER_SUBCONTRACTOR = {}   # chat_id -> subcontractor_name
+USER_KS2_NUMBER    = {}   # chat_id -> ks2_number
 
 GREEN  = "🟢"
 YELLOW = "🟡"
@@ -29,20 +35,24 @@ def get_icon(assess):
     return RED
 
 
-def send(chat_id, text):
-    requests.post(TG + "/sendMessage",
-                  json={"chat_id": chat_id, "text": text[:4096]}, timeout=15)
+def send(chat_id, text, parse_mode=None):
+    payload = {"chat_id": chat_id, "text": text[:4096]}
+    if parse_mode:
+        payload["parse_mode"] = parse_mode
+    requests.post(TG + "/sendMessage", json=payload, timeout=15)
 
 
-def download_voice(file_id):
+def download_file(file_id):
+    """Скачивает любой файл из Telegram по file_id, возвращает байты"""
     r = requests.get(TG + "/getFile", params={"file_id": file_id}, timeout=10)
     if r.status_code != 200:
         return None
     file_path = r.json()["result"]["file_path"]
-    audio = requests.get(
-        "https://api.telegram.org/file/bot" + BOT_TOKEN + "/" + file_path,
-        timeout=30)
-    return audio.content if audio.status_code == 200 else None
+    resp = requests.get(
+        f"https://api.telegram.org/file/bot{BOT_TOKEN}/{file_path}",
+        timeout=60
+    )
+    return resp.content if resp.status_code == 200 else None
 
 
 def transcribe(audio_bytes):
@@ -68,8 +78,8 @@ def structure_report(transcript, object_name=""):
     prompt = (
         obj_hint +
         "Структурируй рапорт. Верни JSON со следующими полями:\n"
-        "object_name (string - используй переданное название объекта если есть),\n"
-        "supervisor (string - имя если назвал или пустая строка),\n"
+        "object_name (string),\n"
+        "supervisor (string),\n"
         "overall_assessment (одно из: В НОРМЕ / НЕЗНАЧИТЕЛЬНОЕ ОТСТАВАНИЕ / ЗНАЧИТЕЛЬНОЕ ОТСТАВАНИЕ / ПЕРЕВЫПОЛНЕНИЕ),\n"
         "completion_pct (number 0-100),\n"
         "works (array of {name, plan, fact, completion_pct}),\n"
@@ -83,13 +93,10 @@ def structure_report(transcript, object_name=""):
     )
     r = requests.post(
         "https://api.openai.com/v1/chat/completions",
-        headers={"Authorization": "Bearer " + OPENAI_KEY,
-                 "Content-Type": "application/json"},
+        headers={"Authorization": "Bearer " + OPENAI_KEY, "Content-Type": "application/json"},
         json={"model": "gpt-4o",
-              "messages": [
-                  {"role": "system", "content": system},
-                  {"role": "user", "content": prompt}
-              ],
+              "messages": [{"role": "system", "content": system},
+                            {"role": "user", "content": prompt}],
               "temperature": 0.1,
               "response_format": {"type": "json_object"}},
         timeout=90)
@@ -109,28 +116,17 @@ def create_notion_page(d):
 
     def rt(text):
         return {"type": "text", "text": {"content": str(text)[:2000]}}
-
     def para(text):
-        return {"object": "block", "type": "paragraph",
-                "paragraph": {"rich_text": [rt(text)]}}
-
+        return {"object": "block", "type": "paragraph", "paragraph": {"rich_text": [rt(text)]}}
     def h2(text):
-        return {"object": "block", "type": "heading_2",
-                "heading_2": {"rich_text": [rt(text)]}}
-
+        return {"object": "block", "type": "heading_2", "heading_2": {"rich_text": [rt(text)]}}
     def bullet(text):
-        return {"object": "block", "type": "bulleted_list_item",
-                "bulleted_list_item": {"rich_text": [rt(text)]}}
-
+        return {"object": "block", "type": "bulleted_list_item", "bulleted_list_item": {"rich_text": [rt(text)]}}
     def todo(text):
-        return {"object": "block", "type": "to_do",
-                "to_do": {"rich_text": [rt(text)], "checked": False}}
-
+        return {"object": "block", "type": "to_do", "to_do": {"rich_text": [rt(text)], "checked": False}}
     def callout(text, emoji):
         return {"object": "block", "type": "callout",
-                "callout": {"rich_text": [rt(text)],
-                            "icon": {"type": "emoji", "emoji": emoji}}}
-
+                "callout": {"rich_text": [rt(text)], "icon": {"type": "emoji", "emoji": emoji}}}
     def divider():
         return {"object": "block", "type": "divider", "divider": {}}
 
@@ -141,7 +137,7 @@ def create_notion_page(d):
         blocks.append(divider())
 
     pct = d.get("completion_pct", 0) or 0
-    hc = d.get("headcount", {})
+    hc  = d.get("headcount", {})
     blocks.append(para(icon + " " + assess + " — " + str(int(pct)) + "% плана"))
     if hc and hc.get("actual"):
         blocks.append(para("Персонал: " + str(hc.get("actual")) + "/" + str(hc.get("planned", "?")) + " чел."))
@@ -153,8 +149,7 @@ def create_notion_page(d):
         for w in works:
             wp = w.get("completion_pct", 0) or 0
             ic = "✅" if wp >= 95 else "⚠️" if wp >= 75 else "🔴"
-            line = ic + " " + w.get("name", "") + " — " + str(w.get("fact", "")) + " из " + str(w.get("plan", "")) + " (" + str(int(wp)) + "%)"
-            blocks.append(bullet(line))
+            blocks.append(bullet(ic + " " + w.get("name", "") + " — " + str(w.get("fact", "")) + " из " + str(w.get("plan", "")) + " (" + str(int(wp)) + "%)"))
         blocks.append(divider())
 
     problems = d.get("problems", [])
@@ -171,7 +166,7 @@ def create_notion_page(d):
     if mats:
         blocks.append(h2("Заявки на материалы"))
         for m in mats:
-            u = m.get("urgency", "")
+            u  = m.get("urgency", "")
             ic = "🔴" if "СРОЧНО" in u else "🟡"
             blocks.append(todo(ic + " " + m.get("material", "") + " — " + str(m.get("needed_qty", "")) + " | срок: " + str(m.get("deadline", ""))))
         blocks.append(divider())
@@ -195,19 +190,15 @@ def create_notion_page(d):
     blocks.append(para("Создано Extella AI | " + today))
 
     obj_name = d.get("object_name", "Объект")
-    sup = d.get("supervisor", "")
-    if sup:
-        title = icon + " " + obj_name + " | " + sup + " | " + today
-    else:
-        title = icon + " " + obj_name + " | " + today
+    sup      = d.get("supervisor", "")
+    title    = icon + " " + obj_name + (" | " + sup if sup else "") + " | " + today
 
     payload = {
         "parent": {"type": "page_id", "page_id": NOTION_PARENT},
         "properties": {"title": {"title": [{"text": {"content": title}}]}},
         "children": blocks[:100]
     }
-    r = requests.post("https://api.notion.com/v1/pages",
-                      headers=NH, json=payload, timeout=30)
+    r = requests.post("https://api.notion.com/v1/pages", headers=NH, json=payload, timeout=30)
     if r.status_code in [200, 201]:
         page_id = r.json().get("id", "").replace("-", "")
         return "https://notion.so/" + page_id
@@ -218,13 +209,13 @@ def notify_director(d, notion_url):
     if not DIRECTOR_CHAT:
         return
     assess = d.get("overall_assessment", "")
-    pct = d.get("completion_pct", 0) or 0
-    icon = get_icon(assess)
-    obj = d.get("object_name", "Объект")
-    sup = d.get("supervisor", "")
-    summ = d.get("summary_for_director", "")
+    pct    = d.get("completion_pct", 0) or 0
+    icon   = get_icon(assess)
+    obj    = d.get("object_name", "Объект")
+    sup    = d.get("supervisor", "")
+    summ   = d.get("summary_for_director", "")
     problems = d.get("problems", [])
-    mats = [m for m in d.get("material_requests", []) if "СРОЧНО" in m.get("urgency", "")]
+    mats   = [m for m in d.get("material_requests", []) if "СРОЧНО" in m.get("urgency", "")]
 
     lines = [icon + " " + obj + " — " + str(int(pct)) + "% плана"]
     if sup:
@@ -244,50 +235,223 @@ def notify_director(d, notion_url):
     send(DIRECTOR_CHAT, "\n".join(lines))
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# КС-2 PIPELINE
+# ─────────────────────────────────────────────────────────────────────────────
+
+def run_ks2_pipeline(chat_id, pdf_bytes, subcontractor, ks2_number):
+    """Кодирует PDF в base64 и вызывает aios_ks2_pipeline_full через Extella API"""
+    if not EXTELLA_TOKEN:
+        send(chat_id, "❌ EXTELLA_API_TOKEN не настроен на сервере. Обратитесь к администратору.")
+        return
+
+    send(chat_id, "⏳ Запускаю анализ КС-2... Это займёт ~30-40 секунд.")
+
+    # Кодируем PDF в base64
+    b64_pdf = base64.b64encode(pdf_bytes).decode("utf-8")
+
+    # Вызываем эксперт через Extella API
+    try:
+        resp = requests.post(
+            f"{EXTELLA_URL}/api/expert/run",
+            headers={
+                "X-Auth-Token": EXTELLA_TOKEN,
+                "Content-Type": "application/json"
+            },
+            json={
+                "expert_name": "aios_ks2_pipeline_full",
+                "params": {
+                    "base64_pdf": b64_pdf,
+                    "subcontractor_name": subcontractor,
+                    "ks2_number": ks2_number,
+                    "telegram_chat_id": str(chat_id)
+                }
+            },
+            timeout=120
+        )
+    except requests.exceptions.Timeout:
+        send(chat_id, "⏱ Превышено время ожидания. Возможно, устройство занято. Попробуй через минуту.")
+        return
+    except Exception as e:
+        send(chat_id, f"❌ Ошибка связи с Extella: {e}")
+        return
+
+    if resp.status_code != 200:
+        send(chat_id, f"❌ Extella API вернул {resp.status_code}. Попробуй позже.")
+        return
+
+    data = resp.json()
+    result = data.get("result", {})
+
+    # Обрабатываем ответ
+    if result.get("status") == "error":
+        step = result.get("step", "?")
+        msg  = result.get("message", "Неизвестная ошибка")
+        send(chat_id, f"❌ Ошибка на шаге {step}: {msg}")
+        return
+
+    # Успешный результат — формируем красивый ответ
+    risk     = result.get("overall_risk", "")
+    dispute  = result.get("dispute_needed", False)
+    overrun  = result.get("overrun_total_tg", 0)
+    total    = result.get("current_total_tg", 0)
+    pct      = result.get("contract_completion_pct", 0)
+    period   = result.get("period", "")
+    items    = result.get("items_extracted", 0)
+    conf     = result.get("ocr_confidence", "?")
+    violations = result.get("violations", [])
+
+    risk_emoji = "🔴" if risk == "ВЫСОКИЙ" else ("🟡" if risk == "СРЕДНИЙ" else "🟢")
+
+    lines = [
+        f"{risk_emoji} <b>КС-2 №{ks2_number} проверен</b>",
+        f"📅 {period} | {subcontractor}",
+        f"📋 Позиций: {items} | OCR: {conf}",
+        f"",
+        f"💰 Сумма акта: <b>{total:,} тг</b>",
+        f"📊 Освоение договора: <b>{pct}%</b>",
+    ]
+
+    if dispute:
+        lines += [
+            f"",
+            f"⚠️ <b>ЗАМЕЧАНИЯ! Превышение: {overrun:,} тг</b>",
+        ]
+        for v in violations[:3]:
+            lines.append(f"  • {v[:80]}")
+        if len(violations) > 3:
+            lines.append(f"  ... и ещё {len(violations)-3}")
+        lines.append(f"")
+        lines.append(f"📄 Письмо-замечание сформировано автоматически")
+    else:
+        lines += [
+            f"",
+            f"✅ <b>Замечаний нет — КС-2 можно принять</b>"
+        ]
+
+    lines += [
+        f"",
+        f"📁 Excel сверка и реестр сохранены на устройстве"
+    ]
+
+    send(chat_id, "\n".join(lines), parse_mode="HTML")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# WEBHOOK
+# ─────────────────────────────────────────────────────────────────────────────
+
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    update = request.json or {}
+    update  = request.json or {}
     message = update.get("message", {})
     chat_id = message.get("chat", {}).get("id")
     if not chat_id:
         return jsonify({"ok": True})
 
-    text = message.get("text", "").strip()
-    voice = message.get("voice")
+    text     = message.get("text", "").strip()
+    voice    = message.get("voice")
+    document = message.get("document")
 
+    # ── /start ──────────────────────────────────────────────────────────────
     if text.startswith("/start"):
         send(chat_id, (
-            "Привет! Я помогаю прорабам сдавать рапорты.\n\n"
-            "1. Укажи свой объект:\n"
-            "   /object ЖК Северный блок 3\n\n"
-            "2. Записывай голосовое после смены — я сам создам рапорт в Notion и уведомлю директора."
+            "Привет! Я помогаю прорабам и ПТО.\n\n"
+            "📢 Голосовой рапорт прораба:\n"
+            "  1. /object ЖК Северный блок 3\n"
+            "  2. Запиши голосовое — создам рапорт в Notion\n\n"
+            "📄 Проверка КС-2 (PDF скан):\n"
+            "  1. /subcontractor ТОО СтройМонтаж\n"
+            "  2. /ks2number 3\n"
+            "  3. Прикрепи PDF — проверю и сообщу результат"
         ))
         return jsonify({"ok": True})
 
+    # ── /object ─────────────────────────────────────────────────────────────
     if text.startswith("/object"):
         obj_name = text[7:].strip()
         if obj_name:
             USER_OBJECTS[chat_id] = obj_name
-            send(chat_id, "Объект запомнен: " + obj_name + "\n\nТеперь просто записывай голосовое после смены.")
+            send(chat_id, "✅ Объект запомнен: " + obj_name + "\n\nТеперь записывай голосовое после смены.")
         else:
             current = USER_OBJECTS.get(chat_id, "не задан")
             send(chat_id, "Текущий объект: " + current + "\n\nЧтобы задать: /object ЖК Северный блок 3")
         return jsonify({"ok": True})
 
+    # ── /subcontractor ───────────────────────────────────────────────────────
+    if text.startswith("/subcontractor"):
+        name = text[14:].strip()
+        if name:
+            USER_SUBCONTRACTOR[chat_id] = name
+            send(chat_id, f"✅ Субподрядчик запомнен: {name}\n\nТеперь отправь PDF скан КС-2.")
+        else:
+            current = USER_SUBCONTRACTOR.get(chat_id, "не задан")
+            send(chat_id, f"Текущий субподрядчик: {current}\n\nЧтобы задать: /subcontractor ТОО СтройМонтаж")
+        return jsonify({"ok": True})
+
+    # ── /ks2number ───────────────────────────────────────────────────────────
+    if text.startswith("/ks2number"):
+        num = text[10:].strip()
+        if num:
+            USER_KS2_NUMBER[chat_id] = num
+            send(chat_id, f"✅ Номер КС-2: {num}\n\nОтправь PDF скан.")
+        else:
+            current = USER_KS2_NUMBER.get(chat_id, "1")
+            send(chat_id, f"Текущий номер КС-2: {current}\n\nЧтобы задать: /ks2number 3")
+        return jsonify({"ok": True})
+
+    # ── /help ────────────────────────────────────────────────────────────────
     if text.startswith("/help"):
-        current = USER_OBJECTS.get(chat_id, "не задан")
         send(chat_id, (
             "Команды:\n"
-            "/object [название] — задать объект\n"
-            "/object — показать текущий\n\n"
-            "Твой объект: " + current + "\n\n"
-            "Для рапорта: просто запиши голосовое."
+            "/object [название] — объект для рапорта\n"
+            "/subcontractor [название] — субподрядчик для КС-2\n"
+            "/ks2number [номер] — номер текущего акта КС-2\n\n"
+            f"Твой объект: {USER_OBJECTS.get(chat_id, 'не задан')}\n"
+            f"Субподрядчик: {USER_SUBCONTRACTOR.get(chat_id, 'не задан')}\n"
+            f"Номер КС-2: {USER_KS2_NUMBER.get(chat_id, '1')}\n\n"
+            "Для рапорта: запиши голосовое.\n"
+            "Для КС-2: прикрепи PDF файл."
         ))
         return jsonify({"ok": True})
 
+    # ── PDF документ → КС-2 пайплайн ─────────────────────────────────────────
+    if document:
+        mime = document.get("mime_type", "")
+        fname = document.get("file_name", "").lower()
+
+        if mime == "application/pdf" or fname.endswith(".pdf"):
+            subcontractor = USER_SUBCONTRACTOR.get(chat_id, "Субподрядчик")
+            ks2_number    = USER_KS2_NUMBER.get(chat_id, "1")
+
+            # Скачиваем PDF
+            pdf_bytes = download_file(document["file_id"])
+            if not pdf_bytes:
+                send(chat_id, "❌ Не удалось скачать файл. Попробуй ещё раз.")
+                return jsonify({"ok": True})
+
+            if len(pdf_bytes) > 20 * 1024 * 1024:  # >20MB
+                send(chat_id, "❌ Файл слишком большой (>20MB). Сожми PDF и отправь снова.")
+                return jsonify({"ok": True})
+
+            run_ks2_pipeline(chat_id, pdf_bytes, subcontractor, ks2_number)
+
+            # Автоматически увеличиваем номер КС для следующего раза
+            try:
+                next_num = str(int(ks2_number) + 1)
+                USER_KS2_NUMBER[chat_id] = next_num
+            except Exception:
+                pass
+
+            return jsonify({"ok": True})
+        else:
+            send(chat_id, "⚠️ Я принимаю только PDF файлы. Отправь скан КС-2 в формате PDF.")
+            return jsonify({"ok": True})
+
+    # ── Голосовой рапорт прораба ─────────────────────────────────────────────
     if voice:
         send(chat_id, "Расшифровываю...")
-        audio_bytes = download_voice(voice["file_id"])
+        audio_bytes = download_file(voice["file_id"])
         if not audio_bytes:
             send(chat_id, "Не удалось скачать аудио. Попробуй ещё раз.")
             return jsonify({"ok": True})
@@ -297,35 +461,33 @@ def webhook():
             return jsonify({"ok": True})
         send(chat_id, "Создаю рапорт...")
         object_name = USER_OBJECTS.get(chat_id, "")
-        report = structure_report(transcript, object_name)
+        report      = structure_report(transcript, object_name)
         if not report:
             send(chat_id, "Ошибка обработки. Попробуй ещё раз.")
             return jsonify({"ok": True})
         notion_url = create_notion_page(report)
         notify_director(report, notion_url)
-        assess = report.get("overall_assessment", "")
-        pct = report.get("completion_pct", 0) or 0
-        icon = get_icon(assess)
-        obj = report.get("object_name", object_name or "Объект")
-        problems = report.get("problems", [])
-        mats = report.get("material_requests", [])
-        lines = [
+        assess  = report.get("overall_assessment", "")
+        pct     = report.get("completion_pct", 0) or 0
+        icon    = get_icon(assess)
+        obj     = report.get("object_name", object_name or "Объект")
+        problems= report.get("problems", [])
+        mats    = report.get("material_requests", [])
+        lines   = [
             icon + " Рапорт принят!",
             "Объект: " + obj,
             assess + " — " + str(int(pct)) + "% плана",
         ]
-        if problems:
-            lines.append("Проблем: " + str(len(problems)))
-        if mats:
-            lines.append("Заявок на материалы: " + str(len(mats)))
-        if notion_url:
-            lines.append("Notion: " + notion_url)
+        if problems: lines.append("Проблем: " + str(len(problems)))
+        if mats:     lines.append("Заявок на материалы: " + str(len(mats)))
+        if notion_url: lines.append("Notion: " + notion_url)
         lines.append("Директор уведомлён.")
         if not object_name:
-            lines.append("\nПодсказка: /object ЖК Северный блок 3  — задай объект один раз")
+            lines.append("\nПодсказка: /object ЖК Северный блок 3")
         send(chat_id, "\n".join(lines))
         return jsonify({"ok": True})
 
+    # ── Длинный текст как рапорт ─────────────────────────────────────────────
     if text and len(text) > 20 and not text.startswith("/"):
         send(chat_id, "Обрабатываю...")
         object_name = USER_OBJECTS.get(chat_id, "")
@@ -341,7 +503,7 @@ def webhook():
 
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({"status": "ok", "service": "aios-foreman-bot"})
+    return jsonify({"status": "ok", "service": "aios-foreman-bot", "version": "2.0-ks2"})
 
 
 @app.route("/set_webhook", methods=["GET"])
@@ -356,5 +518,5 @@ def set_webhook():
 if __name__ == "__main__":
     import logging
     logging.basicConfig(level=logging.INFO)
-    print("Starting AIOS Foreman Bot on port", PORT, flush=True)
+    print("Starting AIOS Foreman Bot v2.0 on port", PORT, flush=True)
     app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False)
