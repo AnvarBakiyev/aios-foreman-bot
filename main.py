@@ -2,6 +2,7 @@ import os
 import json
 import base64
 import tempfile
+import threading
 import requests
 from flask import Flask, request, jsonify
 
@@ -21,6 +22,10 @@ USER_OBJECTS       = {}
 USER_SUBCONTRACTOR = {}
 USER_KS2_NUMBER    = {}
 
+# Защита от двойной обработки: храним update_id последних обработанных
+PROCESSED_UPDATES = set()
+PROCESSED_LOCK    = threading.Lock()
+
 GREEN  = "🟢"
 YELLOW = "🟡"
 RED    = "🔴"
@@ -38,7 +43,10 @@ def send(chat_id, text, parse_mode=None):
     payload = {"chat_id": chat_id, "text": text[:4096]}
     if parse_mode:
         payload["parse_mode"] = parse_mode
-    requests.post(TG + "/sendMessage", json=payload, timeout=15)
+    try:
+        requests.post(TG + "/sendMessage", json=payload, timeout=15)
+    except Exception:
+        pass
 
 
 def download_file(file_id):
@@ -234,12 +242,13 @@ def notify_director(d, notion_url):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# КС-2 PIPELINE
+# КС-2 PIPELINE (асинхронный — через threading)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def run_ks2_pipeline(chat_id, pdf_bytes, subcontractor, ks2_number):
+    """Выполняется в фоновом потоке — Telegram уже получил 200 OK"""
     if not EXTELLA_TOKEN:
-        send(chat_id, "❌ EXTELLA_API_TOKEN не настроен. Обратитесь к администратору.")
+        send(chat_id, "❌ EXTELLA_API_TOKEN не настроен.")
         return
 
     send(chat_id, "⏳ Запускаю анализ КС-2... Это займёт ~30-40 секунд.")
@@ -249,40 +258,34 @@ def run_ks2_pipeline(chat_id, pdf_bytes, subcontractor, ks2_number):
     try:
         resp = requests.post(
             f"{EXTELLA_URL}/api/expert/run",
-            headers={
-                "X-Auth-Token": EXTELLA_TOKEN,
-                "Content-Type": "application/json"
-            },
+            headers={"X-Auth-Token": EXTELLA_TOKEN, "Content-Type": "application/json"},
             json={
                 "expert_name": "aios_ks2_pipeline_full",
                 "params": {
-                    "base64_pdf":        b64_pdf,
-                    "openai_key":        OPENAI_KEY,  # Передаём напрямую — не нужен KV
+                    "base64_pdf":         b64_pdf,
+                    "openai_key":         OPENAI_KEY,
                     "subcontractor_name": subcontractor,
-                    "ks2_number":        ks2_number,
-                    "telegram_chat_id":  str(chat_id)
+                    "ks2_number":         ks2_number,
+                    "telegram_chat_id":   str(chat_id)
                 }
             },
-            timeout=120
+            timeout=150
         )
     except requests.exceptions.Timeout:
-        send(chat_id, "⏱ Превышено время ожидания. Устройство занято. Попробуй через минуту.")
+        send(chat_id, "⏱ Устройство занято. Попробуй через минуту.")
         return
     except Exception as e:
-        send(chat_id, f"❌ Ошибка связи с Extella: {e}")
+        send(chat_id, f"❌ Ошибка: {e}")
         return
 
     if resp.status_code != 200:
         send(chat_id, f"❌ Extella API вернул {resp.status_code}. Попробуй позже.")
         return
 
-    data   = resp.json()
-    result = data.get("result", {})
+    result = resp.json().get("result", {})
 
     if result.get("status") == "error":
-        step = result.get("step", "?")
-        msg  = result.get("message", "Неизвестная ошибка")
-        send(chat_id, f"❌ Ошибка на шаге {step}: {msg}")
+        send(chat_id, f"❌ Ошибка на шаге {result.get('step','?')}: {result.get('message','')}")
         return
 
     risk       = result.get("overall_risk", "")
@@ -305,31 +308,17 @@ def run_ks2_pipeline(chat_id, pdf_bytes, subcontractor, ks2_number):
         f"💰 Сумма акта: <b>{total:,} тг</b>",
         f"📊 Освоение договора: <b>{pct}%</b>",
     ]
-
     if dispute:
-        lines += [
-            f"",
-            f"⚠️ <b>ЗАМЕЧАНИЯ! Превышение: {overrun:,} тг</b>",
-        ]
+        lines += [f"", f"⚠️ <b>ЗАМЕЧАНИЯ! Превышение: {overrun:,} тг</b>"]
         for v in violations[:3]:
             lines.append(f"  • {v[:80]}")
         if len(violations) > 3:
             lines.append(f"  ... и ещё {len(violations)-3}")
-        lines += [
-            f"",
-            f"📄 Письмо-замечание сформировано автоматически"
-        ]
+        lines += [f"", f"📄 Письмо-замечание сформировано автоматически"]
     else:
-        lines += [
-            f"",
-            f"✅ <b>Замечаний нет — КС-2 можно принять</b>"
-        ]
+        lines += [f"", f"✅ <b>Замечаний нет — КС-2 можно принять</b>"]
 
-    lines += [
-        f"",
-        f"📁 Excel сверка и реестр сохранены на устройстве"
-    ]
-
+    lines += [f"", f"📁 Excel сверка и реестр сохранены на устройстве"]
     send(chat_id, "\n".join(lines), parse_mode="HTML")
 
 
@@ -340,15 +329,29 @@ def run_ks2_pipeline(chat_id, pdf_bytes, subcontractor, ks2_number):
 @app.route("/webhook", methods=["POST"])
 def webhook():
     update  = request.json or {}
+    update_id = update.get("update_id")
     message = update.get("message", {})
     chat_id = message.get("chat", {}).get("id")
     if not chat_id:
         return jsonify({"ok": True})
 
+    # Защита от двойной обработки (Telegram retry)
+    if update_id:
+        with PROCESSED_LOCK:
+            if update_id in PROCESSED_UPDATES:
+                return jsonify({"ok": True})  # Уже обработали
+            PROCESSED_UPDATES.add(update_id)
+            # Очищаем старые (храним последние 500)
+            if len(PROCESSED_UPDATES) > 500:
+                oldest = sorted(PROCESSED_UPDATES)[:250]
+                for uid in oldest:
+                    PROCESSED_UPDATES.discard(uid)
+
     text     = message.get("text", "").strip()
     voice    = message.get("voice")
     document = message.get("document")
 
+    # ── /start
     if text.startswith("/start"):
         send(chat_id, (
             "Привет! Я помогаю прорабам и ПТО.\n\n"
@@ -362,24 +365,27 @@ def webhook():
         ))
         return jsonify({"ok": True})
 
+    # ── /object
     if text.startswith("/object"):
         obj_name = text[7:].strip()
         if obj_name:
             USER_OBJECTS[chat_id] = obj_name
-            send(chat_id, "✅ Объект запомнен: " + obj_name + "\n\nТеперь записывай голосовое после смены.")
+            send(chat_id, "✅ Объект запомнен: " + obj_name)
         else:
             send(chat_id, "Текущий объект: " + USER_OBJECTS.get(chat_id, "не задан"))
         return jsonify({"ok": True})
 
+    # ── /subcontractor
     if text.startswith("/subcontractor"):
         name = text[14:].strip()
         if name:
             USER_SUBCONTRACTOR[chat_id] = name
-            send(chat_id, f"✅ Субподрядчик: {name}\n\nОтправь PDF скан КС-2.")
+            send(chat_id, f"✅ Субподрядчик: {name}\n\nТеперь отправь PDF скан КС-2.")
         else:
             send(chat_id, f"Текущий: {USER_SUBCONTRACTOR.get(chat_id, 'не задан')}")
         return jsonify({"ok": True})
 
+    # ── /ks2number
     if text.startswith("/ks2number"):
         num = text[10:].strip()
         if num:
@@ -389,6 +395,7 @@ def webhook():
             send(chat_id, f"Текущий номер: {USER_KS2_NUMBER.get(chat_id, '1')}")
         return jsonify({"ok": True})
 
+    # ── /help
     if text.startswith("/help"):
         send(chat_id, (
             "Команды:\n"
@@ -399,11 +406,12 @@ def webhook():
             f"Субподрядчик: {USER_SUBCONTRACTOR.get(chat_id, 'не задан')}\n"
             f"Номер КС-2: {USER_KS2_NUMBER.get(chat_id, '1')}\n\n"
             "Голосовое → рапорт прораба\n"
-            "PDF → проверка КС-2"
+            "PDF → проверка КС-2\n"
+            "PDF отправляйте по одному и ждите ответа перед следующим"
         ))
         return jsonify({"ok": True})
 
-    # ── PDF → КС-2 пайплайн
+    # ── PDF → КС-2 пайплайн (асинхронно)
     if document:
         mime  = document.get("mime_type", "")
         fname = document.get("file_name", "").lower()
@@ -415,65 +423,80 @@ def webhook():
                 send(chat_id, "❌ Не удалось скачать файл.")
                 return jsonify({"ok": True})
             if len(pdf_bytes) > 20 * 1024 * 1024:
-                send(chat_id, "❌ Файл > 20MB. Сожми и отправь снова.")
+                send(chat_id, "❌ Файл > 20MB.")
                 return jsonify({"ok": True})
-            run_ks2_pipeline(chat_id, pdf_bytes, subcontractor, ks2_number)
+
+            # Авто-инкремент номера КС
             try:
                 USER_KS2_NUMBER[chat_id] = str(int(ks2_number) + 1)
             except Exception:
                 pass
-            return jsonify({"ok": True})
+
+            # Запускаем в фоновом потоке — сразу возвращаем 200 OK
+            t = threading.Thread(
+                target=run_ks2_pipeline,
+                args=(chat_id, pdf_bytes, subcontractor, ks2_number),
+                daemon=True
+            )
+            t.start()
+            return jsonify({"ok": True})  # ← возвращаем Telegram сразу!
         else:
             send(chat_id, "⚠️ Я принимаю только PDF.")
             return jsonify({"ok": True})
 
-    # ── Голосовой рапорт
+    # ── Голосовой рапорт (тоже асинхронно)
     if voice:
-        send(chat_id, "Расшифровываю...")
         audio_bytes = download_file(voice["file_id"])
         if not audio_bytes:
             send(chat_id, "Не удалось скачать аудио.")
             return jsonify({"ok": True})
-        transcript = transcribe(audio_bytes)
-        if not transcript:
-            send(chat_id, "Не удалось расшифровать.")
-            return jsonify({"ok": True})
-        send(chat_id, "Создаю рапорт...")
-        report = structure_report(transcript, USER_OBJECTS.get(chat_id, ""))
-        if not report:
-            send(chat_id, "Ошибка обработки.")
-            return jsonify({"ok": True})
-        notion_url = create_notion_page(report)
-        notify_director(report, notion_url)
-        assess = report.get("overall_assessment", "")
-        pct    = report.get("completion_pct", 0) or 0
-        icon   = get_icon(assess)
-        obj    = report.get("object_name", USER_OBJECTS.get(chat_id, "Объект"))
-        lines  = [icon + " Рапорт принят!", "Объект: " + obj,
-                  assess + " — " + str(int(pct)) + "% плана"]
-        if report.get("problems"): lines.append("Проблем: " + str(len(report["problems"])))
-        if report.get("material_requests"): lines.append("Заявок: " + str(len(report["material_requests"])))
-        if notion_url: lines.append("Notion: " + notion_url)
-        lines.append("Директор уведомлён.")
-        send(chat_id, "\n".join(lines))
+
+        def process_voice():
+            send(chat_id, "Расшифровываю...")
+            transcript = transcribe(audio_bytes)
+            if not transcript:
+                send(chat_id, "Не удалось расшифровать.")
+                return
+            send(chat_id, "Создаю рапорт...")
+            report = structure_report(transcript, USER_OBJECTS.get(chat_id, ""))
+            if not report:
+                send(chat_id, "Ошибка обработки.")
+                return
+            notion_url = create_notion_page(report)
+            notify_director(report, notion_url)
+            assess = report.get("overall_assessment", "")
+            pct    = report.get("completion_pct", 0) or 0
+            icon   = get_icon(assess)
+            obj    = report.get("object_name", USER_OBJECTS.get(chat_id, "Объект"))
+            lines  = [icon + " Рапорт принят!", "Объект: " + obj,
+                      assess + " — " + str(int(pct)) + "% плана"]
+            if report.get("problems"): lines.append("Проблем: " + str(len(report["problems"])))
+            if report.get("material_requests"): lines.append("Заявок: " + str(len(report["material_requests"])))
+            if notion_url: lines.append("Notion: " + notion_url)
+            lines.append("Директор уведомлён.")
+            send(chat_id, "\n".join(lines))
+
+        threading.Thread(target=process_voice, daemon=True).start()
         return jsonify({"ok": True})
 
     # ── Текст как рапорт
     if text and len(text) > 20 and not text.startswith("/"):
-        send(chat_id, "Обрабатываю...")
-        report = structure_report(text, USER_OBJECTS.get(chat_id, ""))
-        if report:
-            notion_url = create_notion_page(report)
-            notify_director(report, notion_url)
-            icon = get_icon(report.get("overall_assessment", ""))
-            send(chat_id, icon + " Готово! " + (notion_url or "Рапорт создан"))
+        def process_text():
+            send(chat_id, "Обрабатываю...")
+            report = structure_report(text, USER_OBJECTS.get(chat_id, ""))
+            if report:
+                notion_url = create_notion_page(report)
+                notify_director(report, notion_url)
+                icon = get_icon(report.get("overall_assessment", ""))
+                send(chat_id, icon + " Готово! " + (notion_url or "Рапорт создан"))
+        threading.Thread(target=process_text, daemon=True).start()
 
     return jsonify({"ok": True})
 
 
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({"status": "ok", "service": "aios-foreman-bot", "version": "2.1"})
+    return jsonify({"status": "ok", "service": "aios-foreman-bot", "version": "2.2"})
 
 
 @app.route("/set_webhook", methods=["GET"])
@@ -488,5 +511,5 @@ def set_webhook():
 if __name__ == "__main__":
     import logging
     logging.basicConfig(level=logging.INFO)
-    print("Starting AIOS Foreman Bot v2.1 on port", PORT, flush=True)
+    print("Starting AIOS Foreman Bot v2.2 on port", PORT, flush=True)
     app.run(host="0.0.0.0", port=PORT, debug=False, use_reloader=False)
