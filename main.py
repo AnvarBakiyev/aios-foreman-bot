@@ -79,7 +79,7 @@ def transcribe(audio_bytes):
 
 
 def structure_report(transcript, object_name=""):
-    system = "Ты опытный начальник смены строительного объекта. Структурируй рапорт проба в JSON."
+    system = "Ты опытный начальник смены строительного объекта. Структурируй рапорт прораба в JSON."
     obj_hint = ("Объект: " + object_name + ". ") if object_name else ""
     prompt = (
         obj_hint +
@@ -127,14 +127,12 @@ def create_notion_page(d):
     blocks = []
     if d.get("summary_for_director"):
         blocks += [callout("Для директора: " + d["summary_for_director"], "📋"), divider()]
-
     pct = d.get("completion_pct", 0) or 0
     hc  = d.get("headcount", {})
     blocks.append(para(icon + " " + assess + " — " + str(int(pct)) + "% плана"))
     if hc and hc.get("actual"):
         blocks.append(para("Персонал: " + str(hc["actual"]) + "/" + str(hc.get("planned", "?")) + " чел."))
     blocks.append(divider())
-
     if d.get("works"):
         blocks.append(h2("Выполнение"))
         for w in d["works"]:
@@ -142,7 +140,6 @@ def create_notion_page(d):
             ic = "✅" if wp >= 95 else "⚠️" if wp >= 75 else "🔴"
             blocks.append(bullet(f"{ic} {w.get('name','')} — {w.get('fact','')} из {w.get('plan','')} ({int(wp)}%)"))
         blocks.append(divider())
-
     if d.get("problems"):
         blocks.append(h2("Проблемы (" + str(len(d["problems"])) + ")"))
         for pr in d["problems"]:
@@ -150,26 +147,22 @@ def create_notion_page(d):
             if pr.get("suggested_action"):
                 blocks.append(todo("→ " + pr["suggested_action"] + " (" + pr.get("responsible", "-") + ")"))
         blocks.append(divider())
-
     if d.get("material_requests"):
         blocks.append(h2("Заявки на материалы"))
         for m in d["material_requests"]:
             ic = "🔴" if "СРОЧНО" in m.get("urgency", "") else "🟡"
             blocks.append(todo(f"{ic} {m.get('material','')} — {m.get('needed_qty','')} | срок: {m.get('deadline','')}"))
         blocks.append(divider())
-
     if d.get("equipment_downtime"):
         blocks.append(h2("Простои"))
         for dt in d["equipment_downtime"]:
             blocks.append(bullet(("✅" if dt.get("resolved") else "🔴") + f" {dt.get('equipment','')} — {dt.get('downtime_hours',0)} ч | {dt.get('reason','')}"))
         blocks.append(divider())
-
     if d.get("next_shift_tasks"):
         blocks.append(h2("Следующей смене"))
         for t in d["next_shift_tasks"]:
             p_ic = "🔴" if "ВЫСОКИЙ" in t.get("priority", "") else "🟡"
             blocks.append(todo(f"{p_ic} {t.get('task','')} → {t.get('responsible','-')}"))
-
     blocks += [divider(), para("Создано Extella AI | " + today)]
     obj_name = d.get("object_name", "Объект")
     sup      = d.get("supervisor", "")
@@ -209,47 +202,77 @@ def notify_director(d, notion_url):
 # КС-2 PIPELINE
 # ───────────────────────────────────────────────────────────────────
 
-def call_extella_expert(expert_name, params, timeout=180):
-    """
-    Запускает эксперт Extella и ждёт результат.
+def kv_get_value(key):
+    """Reads a value from Extella KV Store."""
+    try:
+        headers = {"X-Auth-Token": EXTELLA_TOKEN, "Content-Type": "application/json"}
+        r = requests.post(
+            f"{EXTELLA_URL}/api/kv/get",
+            headers=headers,
+            json={"key": key},
+            timeout=10
+        )
+        if r.status_code == 200:
+            return r.json().get("value")
+    except Exception:
+        pass
+    return None
 
-    Последовательность:
-    1. POST /api/expert/run  →  получаем task_id
-    2. Поллинг /api/task/check пока status != running/busy
-       - running  → продолжаем ждать
-       - completed → забираем результат через /api/task/result
-    3. GET /api/task/result?task_id=...  →  получаем вывод эксперта
+
+def run_ks2_pipeline(chat_id, pdf_bytes, subcontractor, ks2_number):
     """
+    Background thread.
+    1. Calls Extella expert /api/expert/run  → gets task_id
+    2. Polls /api/task/check until device status == 'running' (task done)
+    3. Reads result from KV Store (expert always writes there)
+    4. Sends ONE message to Telegram
+    """
+    if not EXTELLA_TOKEN:
+        send(chat_id, "❌ EXTELLA_API_TOKEN не настроен.")
+        return
+
+    send(chat_id, "⏳ Анализирую КС-2... ~30-60 секунд.")
+
     headers = {"X-Auth-Token": EXTELLA_TOKEN, "Content-Type": "application/json"}
 
-    # 1. Запуск
+    # ШАГ 1: запуск эксперта
     try:
         run_resp = requests.post(
             f"{EXTELLA_URL}/api/expert/run",
             headers=headers,
-            json={"expert_name": expert_name, "params": params},
+            json={
+                "expert_name": "aios_ks2_pipeline_full",
+                "params": {
+                    "base64_pdf":         base64.b64encode(pdf_bytes).decode("utf-8"),
+                    "openai_key":         OPENAI_KEY,
+                    "subcontractor_name": subcontractor,
+                    "ks2_number":         ks2_number,
+                    # telegram_chat_id НЕ передаём — пайплайн не шлёт сам
+                }
+            },
             timeout=30
         )
     except Exception as e:
-        return None, f"Ошибка запуска: {e}"
+        send(chat_id, f"❌ Ошибка запуска: {e}")
+        return
 
     if run_resp.status_code != 200:
-        return None, f"Extella API {run_resp.status_code}: {run_resp.text[:200]}"
+        send(chat_id, f"❌ Extella API {run_resp.status_code}")
+        return
 
-    run_data = run_resp.json()
-    task_id  = run_data.get("task_id")
-
+    task_id = run_resp.json().get("task_id")
     if not task_id:
-        return None, "Нет task_id в ответе Extella"
+        send(chat_id, "❌ Не получен task_id")
+        return
 
-    # 2. Поллинг /api/task/check пока задача не завершится
-    deadline = time.time() + timeout
-    poll_interval = 8
-    completed = False
+    # ШАГ 2: поллинг /api/task/check
+    # check_task возвращает {"result": {"status": "busy"}}  — задача выполняется
+    #                               {"result": {"status": "running"}} — устройство свободно (задача завершена)
+    deadline = time.time() + 180
+    task_done = False
 
     while time.time() < deadline:
-        time.sleep(poll_interval)
-
+        time.sleep(8)
         try:
             check_resp = requests.post(
                 f"{EXTELLA_URL}/api/task/check",
@@ -257,96 +280,58 @@ def call_extella_expert(expert_name, params, timeout=180):
                 json={"task_id": task_id},
                 timeout=15
             )
+            if check_resp.status_code == 200:
+                inner = check_resp.json().get("result", {})
+                if isinstance(inner, str):
+                    try: inner = json.loads(inner)
+                    except: inner = {}
+                device_status = inner.get("status", "")
+                if device_status == "running":
+                    task_done = True
+                    break
+                # busy — продолжаем ждать
         except Exception:
             continue
 
-        if check_resp.status_code != 200:
-            continue
+    if not task_done:
+        send(chat_id, "⏱ Устройство занято больше 3 минут. Попробуй позже.")
+        return
 
-        data = check_resp.json()
-        # Структура ответа check: {"result": {"status": "running"}} или {"result": {"status": "completed"}}
-        inner = data.get("result", {})
-        if isinstance(inner, str):
-            try: inner = json.loads(inner)
-            except: inner = {}
+    # ШАГ 3: читаем результат из KV Store
+    # Эксперт всегда сохраняет результат в 'aios_last_ks2_result'
+    time.sleep(2)  # короткая пауза чтобы KV успел записаться
+    kv_raw = kv_get_value("aios_last_ks2_result")
 
-        device_status = inner.get("status", "")
+    if not kv_raw:
+        send(chat_id, "❌ Результат не найден в KV. Проверьте MacBook.")
+        return
 
-        if device_status == "completed":
-            completed = True
-            break
-
-        # running или busy — продолжаем ждать
-
-    if not completed:
-        return None, f"Превышен лимит ({timeout}с). Устройство занято."
-
-    # 3. Забираем результат через /api/task/result
     try:
-        result_resp = requests.get(
-            f"{EXTELLA_URL}/api/task/result",
-            headers=headers,
-            params={"task_id": task_id},
-            timeout=30
-        )
+        result = json.loads(kv_raw)
     except Exception as e:
-        return None, f"Ошибка получения результата: {e}"
-
-    if result_resp.status_code != 200:
-        return None, f"task/result API {result_resp.status_code}: {result_resp.text[:200]}"
-
-    result_data = result_resp.json()
-    # Ожидаем: {"result": {"status": "success", "items_extracted": 6, ...}}
-    result = result_data.get("result", {})
-    if isinstance(result, str):
-        try: result = json.loads(result)
-        except: result = {}
-
-    return result, None
-
-
-def run_ks2_pipeline(chat_id, pdf_bytes, subcontractor, ks2_number):
-    """Background thread: polls until expert finishes, sends ONE result."""
-    if not EXTELLA_TOKEN:
-        send(chat_id, "❌ EXTELLA_API_TOKEN не настроен.")
+        send(chat_id, f"❌ Ошибка чтения результата: {e}")
         return
 
-    send(chat_id, "⏳ Анализирую КС-2... ~30-60 секунд.")
-
-    result, error = call_extella_expert(
-        "aios_ks2_pipeline_full",
-        {
-            "base64_pdf":         base64.b64encode(pdf_bytes).decode("utf-8"),
-            "openai_key":         OPENAI_KEY,
-            "subcontractor_name": subcontractor,
-            "ks2_number":         ks2_number,
-        },
-        timeout=180
-    )
-
-    if error:
-        send(chat_id, f"❌ {error}")
+    # Верифицируем что это результат нашего запуска (по ks2_number)
+    if result.get("ks2_number") != ks2_number:
+        send(chat_id, f"⚠️ Получен результат другого акта (№{result.get('ks2_number')} вместо №{ks2_number}). Повторите отправку.")
         return
 
-    if not result or result.get("status") == "error":
-        send(chat_id, f"❌ Ошибка: {result.get('message', '') if result else 'Пустой ответ'}")
-        return
-
+    # ШАГ 4: формируем сообщение
     risk       = result.get("overall_risk", "")
     dispute    = result.get("dispute_needed", False)
-    overrun    = result.get("overrun_total_tg", 0)
-    total      = result.get("current_total_tg", 0)
+    overrun    = result.get("cumulative_overrun_total", 0)
+    total      = result.get("current_ks2_total", 0)
     pct        = result.get("contract_completion_pct", 0)
     period     = result.get("period", "")
-    items      = result.get("items_extracted", 0)
-    conf       = result.get("ocr_confidence", "?")
-    violations = result.get("violations", [])
+    items      = len(result.get("items", []))
+    violations = result.get("dispute_grounds", [])
     risk_emoji = "🔴" if risk == "ВЫСОКИЙ" else ("🟡" if risk == "СРЕДНИЙ" else "🟢")
 
     lines = [
         f"{risk_emoji} <b>КС-2 №{ks2_number} — {subcontractor}</b>",
         f"📅 {period}",
-        f"📋 Позиций: {items} | OCR: {conf}",
+        f"📋 Позиций: {items}",
         f"",
         f"💰 Сумма акта: <b>{total:,} тг</b>",
         f"📊 Освоение: <b>{pct}%</b>",
@@ -354,7 +339,7 @@ def run_ks2_pipeline(chat_id, pdf_bytes, subcontractor, ks2_number):
     if dispute:
         lines += [f"", f"⚠️ <b>ЗАМЕЧАНИЯ! Превышение: {overrun:,} тг</b>"]
         for v in violations[:3]: lines.append(f"  • {v[:80]}")
-        if len in violations and len(violations) > 3: lines.append(f"  ... и ещё {len(violations)-3}")
+        if len(violations) > 3: lines.append(f"  ... и ещё {len(violations)-3}")
         lines += [f"", f"📄 Письмо-замечание сформировано автоматически"]
     else:
         lines += [f"", f"✅ <b>Замечаний нет — КС-2 можно принять</b>"]
@@ -389,14 +374,9 @@ def webhook():
     document = message.get("document")
 
     if text.startswith("/start"):
-        send(chat_id, "Привет! Я помогаю пробам и ПТО.\n\n"
-                     "📢 Голосовой рапорт:\n"
-                     "  1. /object ЖК Северный блок 3\n"
-                     "  2. Запиши голосовое\n\n"
-                     "📄 Проверка КС-2 (PDF):\n"
-                     "  1. /subcontractor ТОО СтройМонтаж\n"
-                     "  2. /ks2number 1\n"
-                     "  3. Прикрепи PDF")
+        send(chat_id, "Привет! Я помогаю прорабам и ПТО.\n\n"
+                     "📢 Голосовой рапорт:\n  1. /object ЖК Северный блок 3\n  2. Запиши голосовое\n\n"
+                     "📄 Проверка КС-2 (PDF):\n  1. /subcontractor ТОО СтройМонтаж\n  2. /ks2number 1\n  3. Прикрепи PDF")
         return jsonify({"ok": True})
 
     if text.startswith("/object"):
@@ -427,10 +407,7 @@ def webhook():
         return jsonify({"ok": True})
 
     if text.startswith("/help"):
-        send(chat_id, f"Команды:\n"
-                      f"/object [название] — объект\n"
-                      f"/subcontractor [название] — субподрядчик\n"
-                      f"/ks2number [номер] — номер акта\n\n"
+        send(chat_id, f"Команды:\n/object, /subcontractor, /ks2number\n\n"
                       f"Объект: {USER_OBJECTS.get(chat_id, 'не задан')}\n"
                       f"Субподрядчик: {USER_SUBCONTRACTOR.get(chat_id, 'не задан')}\n"
                       f"Номер КС-2: {USER_KS2_NUMBER.get(chat_id, '1')}\n\n"
@@ -469,7 +446,6 @@ def webhook():
         if not audio_bytes:
             send(chat_id, "Не удалось скачать аудио.")
             return jsonify({"ok": True})
-
         def process_voice():
             send(chat_id, "Расшифровываю...")
             transcript = transcribe(audio_bytes)
@@ -487,14 +463,12 @@ def webhook():
             pct    = report.get("completion_pct", 0) or 0
             icon   = get_icon(assess)
             obj    = report.get("object_name", USER_OBJECTS.get(chat_id, "Объект"))
-            lines  = [icon + " Рапорт принят!", "Объект: " + obj,
-                      assess + " — " + str(int(pct)) + "% плана"]
+            lines  = [icon + " Рапорт принят!", "Объект: " + obj, assess + " — " + str(int(pct)) + "% плана"]
             if report.get("problems"): lines.append("Проблем: " + str(len(report["problems"])))
             if report.get("material_requests"): lines.append("Заявок: " + str(len(report["material_requests"])))
             if notion_url: lines.append("Notion: " + notion_url)
             lines.append("Директор уведомлён.")
             send(chat_id, "\n".join(lines))
-
         threading.Thread(target=process_voice, daemon=True).start()
         return jsonify({"ok": True})
 
@@ -514,7 +488,7 @@ def webhook():
 
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({"status": "ok", "service": "aios-foreman-bot", "version": "2.6"})
+    return jsonify({"status": "ok", "service": "aios-foreman-bot", "version": "2.7"})
 
 
 @app.route("/set_webhook", methods=["GET"])
