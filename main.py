@@ -3,7 +3,6 @@ import json
 import base64
 import tempfile
 import threading
-import time
 import requests
 from flask import Flask, request, jsonify
 
@@ -199,152 +198,45 @@ def notify_director(d, notion_url):
 
 
 # ───────────────────────────────────────────────────────────────────
-# КС-2 PIPELINE
+# КС-2: fire-and-forget
 # ───────────────────────────────────────────────────────────────────
 
-def kv_get_value(key):
-    """Reads a value from Extella KV Store."""
-    try:
-        headers = {"X-Auth-Token": EXTELLA_TOKEN, "Content-Type": "application/json"}
-        r = requests.post(
-            f"{EXTELLA_URL}/api/kv/get",
-            headers=headers,
-            json={"key": key},
-            timeout=10
-        )
-        if r.status_code == 200:
-            return r.json().get("value")
-    except Exception:
-        pass
-    return None
-
-
-def run_ks2_pipeline(chat_id, pdf_bytes, subcontractor, ks2_number):
+def launch_ks2_pipeline(chat_id, pdf_bytes, subcontractor, ks2_number):
     """
-    Background thread.
-    1. Calls Extella expert /api/expert/run  → gets task_id
-    2. Polls /api/task/check until device status == 'running' (task done)
-    3. Reads result from KV Store (expert always writes there)
-    4. Sends ONE message to Telegram
+    Fire-and-forget: запускаем эксперт с telegram_chat_id.
+    Эксперт сам отправляет результат в Telegram.
+    Бот НИЧЕГО не ждёт и НИЧЕГО не отправляет.
     """
     if not EXTELLA_TOKEN:
         send(chat_id, "❌ EXTELLA_API_TOKEN не настроен.")
         return
 
-    send(chat_id, "⏳ Анализирую КС-2... ~30-60 секунд.")
-
     headers = {"X-Auth-Token": EXTELLA_TOKEN, "Content-Type": "application/json"}
+    b64_pdf = base64.b64encode(pdf_bytes).decode("utf-8")
 
-    # ШАГ 1: запуск эксперта
     try:
-        run_resp = requests.post(
+        # Просто запускаем. Не ждём результата.
+        requests.post(
             f"{EXTELLA_URL}/api/expert/run",
             headers=headers,
             json={
                 "expert_name": "aios_ks2_pipeline_full",
                 "params": {
-                    "base64_pdf":         base64.b64encode(pdf_bytes).decode("utf-8"),
+                    "base64_pdf":         b64_pdf,
                     "openai_key":         OPENAI_KEY,
                     "subcontractor_name": subcontractor,
                     "ks2_number":         ks2_number,
-                    # telegram_chat_id НЕ передаём — пайплайн не шлёт сам
+                    "telegram_chat_id":   str(chat_id),  # ВОТ ГЛАВНОЕ: реальный chat_id
                 }
             },
-            timeout=30
+            timeout=30  # ждём только подтверждения запуска, не выполнения
         )
+        # Дальше ничего не делаем.
+        # Эксперт сам уведомит пользователя через telegram_chat_id.
+    except requests.exceptions.Timeout:
+        pass  # нормально, задача всё равно запущена
     except Exception as e:
         send(chat_id, f"❌ Ошибка запуска: {e}")
-        return
-
-    if run_resp.status_code != 200:
-        send(chat_id, f"❌ Extella API {run_resp.status_code}")
-        return
-
-    task_id = run_resp.json().get("task_id")
-    if not task_id:
-        send(chat_id, "❌ Не получен task_id")
-        return
-
-    # ШАГ 2: поллинг /api/task/check
-    # check_task возвращает {"result": {"status": "busy"}}  — задача выполняется
-    #                               {"result": {"status": "running"}} — устройство свободно (задача завершена)
-    deadline = time.time() + 180
-    task_done = False
-
-    while time.time() < deadline:
-        time.sleep(8)
-        try:
-            check_resp = requests.post(
-                f"{EXTELLA_URL}/api/task/check",
-                headers=headers,
-                json={"task_id": task_id},
-                timeout=15
-            )
-            if check_resp.status_code == 200:
-                inner = check_resp.json().get("result", {})
-                if isinstance(inner, str):
-                    try: inner = json.loads(inner)
-                    except: inner = {}
-                device_status = inner.get("status", "")
-                if device_status == "running":
-                    task_done = True
-                    break
-                # busy — продолжаем ждать
-        except Exception:
-            continue
-
-    if not task_done:
-        send(chat_id, "⏱ Устройство занято больше 3 минут. Попробуй позже.")
-        return
-
-    # ШАГ 3: читаем результат из KV Store
-    # Эксперт всегда сохраняет результат в 'aios_last_ks2_result'
-    time.sleep(2)  # короткая пауза чтобы KV успел записаться
-    kv_raw = kv_get_value("aios_last_ks2_result")
-
-    if not kv_raw:
-        send(chat_id, "❌ Результат не найден в KV. Проверьте MacBook.")
-        return
-
-    try:
-        result = json.loads(kv_raw)
-    except Exception as e:
-        send(chat_id, f"❌ Ошибка чтения результата: {e}")
-        return
-
-    # Верифицируем что это результат нашего запуска (по ks2_number)
-    if result.get("ks2_number") != ks2_number:
-        send(chat_id, f"⚠️ Получен результат другого акта (№{result.get('ks2_number')} вместо №{ks2_number}). Повторите отправку.")
-        return
-
-    # ШАГ 4: формируем сообщение
-    risk       = result.get("overall_risk", "")
-    dispute    = result.get("dispute_needed", False)
-    overrun    = result.get("cumulative_overrun_total", 0)
-    total      = result.get("current_ks2_total", 0)
-    pct        = result.get("contract_completion_pct", 0)
-    period     = result.get("period", "")
-    items      = len(result.get("items", []))
-    violations = result.get("dispute_grounds", [])
-    risk_emoji = "🔴" if risk == "ВЫСОКИЙ" else ("🟡" if risk == "СРЕДНИЙ" else "🟢")
-
-    lines = [
-        f"{risk_emoji} <b>КС-2 №{ks2_number} — {subcontractor}</b>",
-        f"📅 {period}",
-        f"📋 Позиций: {items}",
-        f"",
-        f"💰 Сумма акта: <b>{total:,} тг</b>",
-        f"📊 Освоение: <b>{pct}%</b>",
-    ]
-    if dispute:
-        lines += [f"", f"⚠️ <b>ЗАМЕЧАНИЯ! Превышение: {overrun:,} тг</b>"]
-        for v in violations[:3]: lines.append(f"  • {v[:80]}")
-        if len(violations) > 3: lines.append(f"  ... и ещё {len(violations)-3}")
-        lines += [f"", f"📄 Письмо-замечание сформировано автоматически"]
-    else:
-        lines += [f"", f"✅ <b>Замечаний нет — КС-2 можно принять</b>"]
-    lines += [f"", f"📁 Excel сверка и реестр сохранены на устройстве"]
-    send(chat_id, "\n".join(lines), parse_mode="HTML")
 
 
 # ───────────────────────────────────────────────────────────────────
@@ -411,9 +303,10 @@ def webhook():
                       f"Объект: {USER_OBJECTS.get(chat_id, 'не задан')}\n"
                       f"Субподрядчик: {USER_SUBCONTRACTOR.get(chat_id, 'не задан')}\n"
                       f"Номер КС-2: {USER_KS2_NUMBER.get(chat_id, '1')}\n\n"
-                      f"PDF отправляйте по одному, ждите ответа")
+                      f"PDF отправляйте по одному, результат придёт автоматически")
         return jsonify({"ok": True})
 
+    # ── PDF → КС-2 (fire-and-forget)
     if document:
         mime  = document.get("mime_type", "")
         fname = document.get("file_name", "").lower()
@@ -431,8 +324,13 @@ def webhook():
                 USER_KS2_NUMBER[chat_id] = str(int(ks2_number) + 1)
             except Exception:
                 pass
+
+            # Сообщаем что получили файл
+            send(chat_id, "⏳ Анализирую КС-2... Результат придёт через ~30-60 секунд.")
+
+            # Запускаем в фоновом потоке
             threading.Thread(
-                target=run_ks2_pipeline,
+                target=launch_ks2_pipeline,
                 args=(chat_id, pdf_bytes, subcontractor, ks2_number),
                 daemon=True
             ).start()
@@ -441,6 +339,7 @@ def webhook():
             send(chat_id, "⚠️ Я принимаю только PDF.")
             return jsonify({"ok": True})
 
+    # ── Голосовой рапорт
     if voice:
         audio_bytes = download_file(voice["file_id"])
         if not audio_bytes:
@@ -472,6 +371,7 @@ def webhook():
         threading.Thread(target=process_voice, daemon=True).start()
         return jsonify({"ok": True})
 
+    # ── Текст как рапорт
     if text and len(text) > 20 and not text.startswith("/"):
         def process_text():
             send(chat_id, "Обрабатываю...")
@@ -488,7 +388,7 @@ def webhook():
 
 @app.route("/health", methods=["GET"])
 def health():
-    return jsonify({"status": "ok", "service": "aios-foreman-bot", "version": "2.7"})
+    return jsonify({"status": "ok", "service": "aios-foreman-bot", "version": "2.8"})
 
 
 @app.route("/set_webhook", methods=["GET"])
