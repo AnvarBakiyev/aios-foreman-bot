@@ -1,6 +1,6 @@
 {
   "deploy": {
-    "startCommand": "python main.py",
+    "startCommand": "gunicorn main:app --workers 1 --threads 4 --timeout 180 --bind 0.0.0.0:$PORT",
     "healthcheckPath": "/health",
     "healthcheckTimeout": 30
   }
